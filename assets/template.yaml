@@ -1,0 +1,31 @@
+analysis:
+  analysisMode: PASS_ONLY
+  frequencySources: [THOUSAND_GENOMES, TOPMED, UK10K, ESP_AFRICAN_AMERICAN, ESP_EUROPEAN_AMERICAN,
+    ESP_ALL, EXAC_AFRICAN_INC_AFRICAN_AMERICAN, EXAC_AMERICAN, EXAC_SOUTH_ASIAN, EXAC_EAST_ASIAN,
+    EXAC_NON_FINNISH_EUROPEAN, GNOMAD_E_AFR, GNOMAD_E_AMR, GNOMAD_E_EAS, GNOMAD_E_NFE,
+    GNOMAD_E_SAS, GNOMAD_G_AFR, GNOMAD_G_AMR, GNOMAD_G_EAS, GNOMAD_G_NFE, GNOMAD_G_SAS]
+  genomeAssembly: hg38
+  hpoIds: [
+    "HP:0001878",
+  ]
+  inheritanceModes: {AUTOSOMAL_DOMINANT: 0.01, AUTOSOMAL_RECESSIVE_COMP_HET: 0.1, AUTOSOMAL_RECESSIVE_HOM_ALT: 0.1,
+    MITOCHONDRIAL: 0.2, X_DOMINANT: 0.1, X_RECESSIVE_COMP_HET: 2.0, X_RECESSIVE_HOM_ALT: 0.1}
+  pathogenicitySources: [REVEL, MVP, REMM, CADD, ALPHA_MISSENSE, SPLICE_AI]
+  ped: null
+  proband: null
+  preset: GENOME
+  steps:
+  # - variantEffectFilter:
+      # remove: []
+  - frequencyFilter: {maxFrequency: 0.1}
+  - pathogenicityFilter: {keepNonPathogenic: true}
+  - inheritanceFilter: {}
+  - omimPrioritiser: {}
+  - hiPhivePrioritiser: {}
+  vcf: /input/$example.vcf.gz
+outputOptions:
+  numGenes: 0
+  outputContributingVariantsOnly: false
+  outputDirectory: /output/$example
+  outputFileName: $example
+  outputFormats: [HTML, JSON, TSV_GENE, TSV_VARIANT, VCF]

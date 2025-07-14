@@ -102,12 +102,10 @@ workflow {
         )
 
         RUN_VEP_SPLIT(
-            affected_samples_ch,
             RUN_VEP_ANNOTATION.out.vep_vcf
         )
 
         RUN_EXOMISER_SPLIT(
-            affected_samples_ch,
             RUN_VEP_SPLIT.out.vep_tsv,
             file(params.exomiser_split_python_script_path, checkIfExists:true)
         )
@@ -139,8 +137,9 @@ process MERGE_COHORT_VCF {
     echo -e "${ped_content}" > cohort.ped
     for vcf in ${vcf_files}; do bcftools index -f \$vcf; done
 
-    bcftools merge --threads 16 -Oz -o cohort.merged.vcf.gz ${vcf_files} && \\
+    bcftools merge -m none --threads 16 -Oz -o cohort.merged.vcf.gz ${vcf_files} && \\
     bcftools view cohort.merged.vcf.gz | \\
+        bcftools norm -m-any | \\
         bcftools +fill-tags -- -t VAF | \\
         bcftools +setGT -- -t q -n . -i 'FORMAT/DP <= 3' 2>/dev/null | \\
         bcftools +setGT -- -t q -n . -i 'FORMAT/DP < 6 & FORMAT/VAF < 1' 2>/dev/null | \\
@@ -182,7 +181,7 @@ process EXTRACT_AND_ANNOTATE_SAMPLE {
     echo '##FORMAT=<ID=maternal_GT,Number=1,Type=String,Description="Maternal genotype">' > mat_hdr.txt
     echo '##FORMAT=<ID=paternal_GT,Number=1,Type=String,Description="Paternal genotype">' > pat_hdr.txt
     # Extract this sample's variants from the merged cohort VCF
-    bcftools view -s $sample_id -Oz -o current.vcf.gz $merged_vcf
+    bcftools view -I -s $sample_id -Oz -o current.vcf.gz $merged_vcf
     bcftools view -h current.vcf.gz > oldheader
     echo "\$(sed \\\$d oldheader; cat mat_hdr.txt; cat pat_hdr.txt; sed -n \\\$p oldheader)"> newheader
     bcftools reheader -h newheader current.vcf.gz | bcftools view -Oz -o reheadered.vcf.gz
@@ -302,10 +301,14 @@ process RUN_VEP_ANNOTATION{
     vep \\
         --fork 16 --buffer_size 50000 -i $exomiser_vcf \\
         --dir_cache $vep_data_dir --cache --merged --force_overwrite \\
+        --dir_plugins $vep_data_dir/plugins \\
         --af_1kg --af_gnomade --af_gnomadg --check_existing \\
         --pick --pick_order mane_select \\
         --compress_output gzip --vcf --output_file ${sample_id}.vep.vcf.gz \\
-        --custom file=$clinvar_vcf,short_name=ClinVar,format=vcf,type=exact,coords=0,fields=CLNSIG%CLNREVSTAT%CLNDN
+        --custom file=$clinvar_vcf,short_name=ClinVar,format=vcf,type=exact,coords=0,fields=CLNSIG%CLNREVSTAT%CLNDN \\
+        --custom file=$vep_data_dir/ucsc/repeatmasker.GRCh38.bed.gz,short_name=repeatmasker,format=bed,type=overlap,coords=1 \\
+		--plugin SpliceAI,snv=$vep_data_dir/spliceai/spliceai_scores.raw.snv.hg38.vcf.gz,indel=$vep_data_dir/spliceai/spliceai_scores.raw.indel.hg38.vcf.gz \\
+		--plugin dbNSFP,$vep_data_dir/dbNSFP/dbNSFP5.2a_grch38.gz,AlphaMissense_pred,AlphaMissense_rankscore,AlphaMissense_score,CADD_raw,CADD_phred,MetaRNN_pred,MetaRNN_score,RegeneronMe_ALL_AC,MutationTaster_pred,MutationTaster_score,ClinPred_pred
     """
 }
 
@@ -314,8 +317,7 @@ process RUN_VEP_SPLIT{
     publishDir "${params.outdir}/${meta.sample_id}", mode: 'copy', pattern: "*.vep.tsv", overwrite: true
 
     input:
-    tuple val(meta), path(original_vcf), path(original_vcf_index)
-    tuple val(vep_meta), path(vep_vcf)
+    tuple val(meta), path(vep_vcf)
 
     output:
     tuple val(meta), path("${meta.sample_id}.vep.tsv"), emit: vep_tsv
@@ -323,7 +325,7 @@ process RUN_VEP_SPLIT{
     script:
     def sample_id = meta.sample_id
     """
-    columns="[%SAMPLE]\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%ID\\t%FILTER\\t%Exomiser[\\t%GT\\t%maternal_GT\\t%paternal_GT\\t%VAF\\t%AD\\t%DP]\$(bcftools +split-vep -l ${vep_vcf} | cut -f2 | sed 's/^/\\\\\\\\t%/' | tr -d '\n' | xargs)"
+    columns="[%SAMPLE]\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%ID\\t%FILTER\\t%Exomiser[\\t%GT\\t%maternal_GT\\t%paternal_GT\\t%VAF\\t%AD\\t%DP\\t%DNM\\t%VA]\\t%AC_Het\\t%AC_Hom\\t%AC_Hemi\\t%HWE\\t%ExcHet\\t%AN\\t%AC\$(bcftools +split-vep -l ${vep_vcf} | cut -f2 | sed 's/^/\\\\\\\\t%/' | tr -d '\n' | xargs)"
     header=\$(echo "\$columns" | sed "s/%//g;s/\\[//g;s/\\]//g")
 
     (echo -e \$header; bcftools view ${vep_vcf} | \\
@@ -336,8 +338,7 @@ process RUN_EXOMISER_SPLIT{
     publishDir "${params.outdir}/${meta.sample_id}", mode: 'copy', pattern: "*.vep.populated.tsv", overwrite: true
 
     input:
-    tuple val(meta), path(original_vcf), path(original_vcf_index)
-    tuple val(tsv_meta), path(vep_tsv)
+    tuple val(meta), path(vep_tsv)
     path python_script
 
     output:

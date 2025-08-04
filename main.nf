@@ -303,7 +303,7 @@ process RUN_VEP_ANNOTATION{
         --dir_cache $vep_data_dir --cache --merged --force_overwrite \\
         --dir_plugins $vep_data_dir/plugins \\
         --af_1kg --af_gnomade --af_gnomadg --check_existing \\
-        --per_gene --pick --pick_order mane_select \\
+        --per_gene --pick_order mane_select \\
         --compress_output gzip --vcf --output_file ${sample_id}.vep.vcf.gz \\
         --custom file=$clinvar_vcf,short_name=ClinVar,format=vcf,type=exact,coords=0,fields=CLNSIG%CLNREVSTAT%CLNDN \\
         --custom file=$vep_data_dir/ucsc/repeatmasker.GRCh38.bed.gz,short_name=repeatmasker,format=bed,type=overlap,coords=1 \\

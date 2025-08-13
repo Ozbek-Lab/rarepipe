@@ -307,6 +307,7 @@ process RUN_VEP_ANNOTATION{
         --compress_output gzip --vcf --output_file ${sample_id}.vep.vcf.gz \\
         --custom file=$clinvar_vcf,short_name=ClinVar,format=vcf,type=exact,coords=0,fields=CLNSIG%CLNREVSTAT%CLNDN \\
         --custom file=$vep_data_dir/ucsc/repeatmasker.GRCh38.bed.gz,short_name=repeatmasker,format=bed,type=overlap,coords=1 \\
+        --custom file=$vep_data_dir/promoterai/promoterAI_tss500.GRCh38.vcf.gz,short_name=PromoterAI,format=vcf,type=exact,coords=0,fields=PromoterAIScore \\
         --plugin SpliceAI,snv=$vep_data_dir/spliceai/spliceai_scores.raw.snv.hg38.vcf.gz,indel=$vep_data_dir/spliceai/spliceai_scores.raw.indel.hg38.vcf.gz \\
         --plugin dbNSFP,$vep_data_dir/dbNSFP/dbNSFP5.2a_grch38.gz,AlphaMissense_pred,AlphaMissense_rankscore,AlphaMissense_score,CADD_raw,CADD_phred,MetaRNN_pred,MetaRNN_score,RegeneronMe_ALL_AC,MutationTaster_pred,MutationTaster_score,ClinPred_pred
     """

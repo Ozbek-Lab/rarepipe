@@ -156,7 +156,7 @@ process MERGE_COHORT_VCF {
 
 process EXTRACT_AND_ANNOTATE_SAMPLE {
     tag "${meta.sample_id}"
-    publishDir "${params.outdir}/annotated_vcfs", mode: 'copy', pattern: "*.vcf.gz*", overwrite: true
+    // REMOVED publishDir "${params.outdir}/annotated_vcfs", mode: 'copy', pattern: "*.vcf.gz*", overwrite: true
 
     // MODIFIED: Input now includes the full cohort metadata (`all_meta`)
     input:
@@ -300,8 +300,8 @@ process RUN_VEP_ANNOTATION{
     """
     vep \\
         --fork 16 --buffer_size 50000 -i $exomiser_vcf \\
-        --dir_cache $vep_data_dir --cache --merged --force_overwrite \\
-        --dir_plugins $vep_data_dir/plugins \\
+        --dir_cache $vep_data_dir --offline --cache --merged --force_overwrite \\
+        --dir_plugins $vep_data_dir/plugins --format vcf \\
         --af_1kg --af_gnomade --af_gnomadg --check_existing \\
         --per_gene --pick_order mane_select \\
         --compress_output gzip --vcf --output_file ${sample_id}.vep.vcf.gz \\

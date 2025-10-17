@@ -156,7 +156,7 @@ process MERGE_COHORT_VCF {
 
 process EXTRACT_AND_ANNOTATE_SAMPLE {
     tag "${meta.sample_id}"
-    publishDir "${params.outdir}/annotated_vcfs", mode: 'copy', pattern: "*.vcf.gz*", overwrite: true
+    // publishDir "${params.outdir}/annotated_vcfs", mode: 'copy', pattern: "*.vcf.gz*", overwrite: true
 
     // MODIFIED: Input now includes the full cohort metadata (`all_meta`)
     input:

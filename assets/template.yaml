@@ -8,8 +8,7 @@ analysis:
   hpoIds: [
     "HP:0001878",
   ]
-  inheritanceModes: {AUTOSOMAL_DOMINANT: 0.01, AUTOSOMAL_RECESSIVE_COMP_HET: 0.1, AUTOSOMAL_RECESSIVE_HOM_ALT: 0.1,
-    MITOCHONDRIAL: 0.2, X_DOMINANT: 0.1, X_RECESSIVE_COMP_HET: 2.0, X_RECESSIVE_HOM_ALT: 0.1}
+  inheritanceModes: {}
   pathogenicitySources: [REVEL, MVP, REMM, CADD, ALPHA_MISSENSE, SPLICE_AI]
   ped: null
   proband: null

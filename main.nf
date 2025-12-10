@@ -14,7 +14,13 @@ nextflow.enable.dsl=2
     5. The final annotated VCFs for affected samples are processed with Exomiser and VEP.
 ----------------------------------------------------------------------------------------
 */
+"""
+touch "NONE.fq"
+"""
 
+
+params.input_merged_vcf = "NONE.fq"  // Path to pre-merged cohort VCF (if available)
+params.input_merged_vcf_index = "NONE.fq.csi"  // Path to index of pre-merged cohort VCF (if available)
 // --- Log pipeline parameters ---
 log.info """
           E X O M I S E R - N F   P I P E L I N E (Cohort Run with Pedigree)
@@ -33,7 +39,6 @@ log.info """
 
 workflow {
     main:
-        // 1. Read the samplesheet, validate, and collect all samples
         Channel
             .fromPath(params.samplesheet)
             .ifEmpty { error "Samplesheet file not found: ${params.samplesheet}" }
@@ -58,8 +63,23 @@ workflow {
             .collect()
             .set { cohort_ch }
 
+        if(params.input_merged_vcf != "NONE.fq"){
+            log.info "Checking provided merged VCF for duplicates: ${params.input_merged_vcf}"
+            CHECK_EXISTING_SAMPLE_IN_MERGED_VCF(
+                file(params.input_merged_vcf, checkIfExists:true),
+                file(params.input_merged_vcf_index, checkIfExists:true),
+                cohort_ch
+            )
+        }
+        else{
+            log.info "No provided merged VCF, will create new merged VCF from individual sample VCFs."
+        }
+
         // 2. Merge VCFs for the entire cohort (affected + unaffected)
-        MERGE_COHORT_VCF(cohort_ch)
+        MERGE_COHORT_VCF(cohort_ch,
+            file(params.input_merged_vcf),
+            file(params.input_merged_vcf_index)
+        )
 
         // 3. Split the merged VCF and annotate each sample with parental genotypes
         MERGE_COHORT_VCF.out.flatMap { all_meta, merged_vcf, merged_vcf_index ->
@@ -68,7 +88,6 @@ workflow {
             }
         }
         .set { samples_to_process_ch }
-
 
         EXTRACT_AND_ANNOTATE_SAMPLE(samples_to_process_ch)
 
@@ -116,12 +135,42 @@ workflow {
 // as they need to run on the full cohort. All other processes are also identical
 // but will now only be executed for the filtered, affected samples.
 
+process CHECK_EXISTING_SAMPLE_IN_MERGED_VCF {
+    // Exists upon encountering any sample already present in the provided merged VCF
+    input:
+    path(input_merged_vcf)
+    path(input_merged_vcf_index)
+    val(meta_list)
+
+    script:
+    def vcf_files = meta_list.collect { it.vcf }.join(' ')
+    """
+    echo "existing samples are: $vcf_files"
+    # Gather existing samples from the provided merged VCF (if possible)
+    EXISTING_SAMPLES=\$(bcftools query -l ${input_merged_vcf} 2>/dev/null || true)
+    echo "Existing samples in provided merged VCF: \$EXISTING_SAMPLES"
+
+    # Build list of VCF files to add by checking sample name in each per-sample VCF
+    VCFS_TO_ADD=""
+    for vcf in ${vcf_files}; do
+        bcftools index -f \$vcf
+        sample_name=\$(bcftools query -l \$vcf | head -n1 || true)
+        if [ -n "\$sample_name" ] && echo "\$EXISTING_SAMPLES" | grep -qx "\$sample_name"; then
+            echo "New sample \$sample_name is already present in provided merged VCF; exiting."
+            exit 2
+        fi
+    done
+    """
+}
+
 process MERGE_COHORT_VCF {
-    tag "Merging ${meta_list.size()} samples in cohort"
+    tag "Merging ${meta_list.size()} samples into merged VCF"
     publishDir "${params.outdir}/pipeline_info/merged_vcfs", mode: 'copy', pattern: "*.vcf.gz*", overwrite: true
 
     input:
     val(meta_list)
+    path(input_merged_vcf)
+    path(input_merged_vcf_index)
 
     output:
     tuple val(meta_list), path("cohort.merged.dnm.vcf.gz"), path("cohort.merged.dnm.vcf.gz.tbi"), emit: merged_vcf_cohort
@@ -131,13 +180,16 @@ process MERGE_COHORT_VCF {
     def ped_content = meta_list.collect {
         "${it.famid}\t${it.sample_id}\t${it.father_id}\t${it.mother_id}\t${it.sex}\t${it.affected}"
     }.join('\\n')
+    def merged_file = input_merged_vcf.getName() == "NONE.fq" ? "" : input_merged_vcf.name
 
     """
-    echo "Processing full cohort..."
+    echo -e "${ped_content}" > cohort.ped
+    echo "Processing with provided merged VCF: ${input_merged_vcf}"
+    
+    echo "Creating new merged VCF from individual sample VCFs"
     echo -e "${ped_content}" > cohort.ped
     for vcf in ${vcf_files}; do bcftools index -f \$vcf; done
-
-    bcftools merge -m none --threads 16 -Oz -o cohort.merged.vcf.gz ${vcf_files} && \\
+    bcftools merge -m none --threads 16 -Oz -o cohort.merged.vcf.gz ${merged_file} ${vcf_files}
     bcftools view cohort.merged.vcf.gz | \\
         bcftools norm -m-any | \\
         bcftools +fill-tags -- -t VAF | \\
@@ -282,7 +334,6 @@ process GET_CLINVAR_REF{
     """
 }
 
-
 process RUN_VEP_ANNOTATION{
     tag "${meta.sample_id}"
     container 'ensemblorg/ensembl-vep:release_113.4'
@@ -308,6 +359,7 @@ process RUN_VEP_ANNOTATION{
         --custom file=$clinvar_vcf,short_name=ClinVar,format=vcf,type=exact,coords=0,fields=CLNSIG%CLNREVSTAT%CLNDN \\
         --custom file=$vep_data_dir/ucsc/repeatmasker.GRCh38.bed.gz,short_name=repeatmasker,format=bed,type=overlap,coords=1 \\
         --custom file=$vep_data_dir/promoterai/promoterAI_tss500.GRCh38.vcf.gz,short_name=PromoterAI,format=vcf,type=exact,coords=0,fields=PromoterAIScore \\
+        --custom file=$vep_data_dir/primateai3d/PrimateAI-3D.hg38.vcf.gz,short_name=PrimateAI3D,format=vcf,type=exact,coords=0,fields=PrimateAI3DScore%PrimateAI3DPrediction \\
         --plugin SpliceAI,snv=$vep_data_dir/spliceai/spliceai_scores.raw.snv.hg38.vcf.gz,indel=$vep_data_dir/spliceai/spliceai_scores.raw.indel.hg38.vcf.gz \\
         --plugin dbNSFP,$vep_data_dir/dbNSFP/dbNSFP5.2a_grch38.gz,AlphaMissense_pred,AlphaMissense_rankscore,AlphaMissense_score,CADD_raw,CADD_phred,MetaRNN_pred,MetaRNN_score,RegeneronMe_ALL_AC,MutationTaster_pred,MutationTaster_score,ClinPred_pred
     """

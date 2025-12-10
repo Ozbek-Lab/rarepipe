@@ -208,9 +208,6 @@ process MERGE_COHORT_VCF {
 
 process EXTRACT_AND_ANNOTATE_SAMPLE {
     tag "${meta.sample_id}"
-    // REMOVED publishDir "${params.outdir}/annotated_vcfs", mode: 'copy', pattern: "*.vcf.gz*", overwrite: true
-
-    // MODIFIED: Input now includes the full cohort metadata (`all_meta`)
     input:
     tuple val(meta), val(all_meta), path(merged_vcf), path(merged_vcf_index)
 

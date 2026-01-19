@@ -1,4 +1,5 @@
 #!/usr/bin/env nextflow
+import java.text.SimpleDateFormat
 nextflow.enable.dsl=2
 
 /*
@@ -173,7 +174,7 @@ process MERGE_COHORT_VCF {
     path(input_merged_vcf_index)
 
     output:
-    tuple val(meta_list), path("cohort.merged.dnm.vcf.gz"), path("cohort.merged.dnm.vcf.gz.tbi"), emit: merged_vcf_cohort
+    tuple val(meta_list), path("cohort_${timestamp}.merged.vcf.gz"), path("cohort_${timestamp}.merged.vcf.gz.tbi"), emit: merged_vcf_cohort
 
     script:
     def vcf_files = meta_list.collect { it.vcf }.join(' ')
@@ -182,6 +183,10 @@ process MERGE_COHORT_VCF {
     }.join('\\n')
     def merged_file = input_merged_vcf.getName() == "NONE.fq" ? "" : input_merged_vcf.name
 
+    Date now = new Date();
+    SimpleDateFormat timestamp_formatter = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss");
+    timestamp = timestamp_formatter.format(now)
+
     """
     echo -e "${ped_content}" > cohort.ped
     echo "Processing with provided merged VCF: ${input_merged_vcf}"
@@ -189,8 +194,8 @@ process MERGE_COHORT_VCF {
     echo "Creating new merged VCF from individual sample VCFs"
     echo -e "${ped_content}" > cohort.ped
     for vcf in ${vcf_files}; do bcftools index -f \$vcf; done
-    bcftools merge -m none --threads 16 -Oz -o cohort.merged.vcf.gz ${merged_file} ${vcf_files}
-    bcftools view cohort.merged.vcf.gz | \\
+    bcftools merge -m none --threads 16 -Oz -o cohort.merged.preprocessed.vcf.gz ${merged_file} ${vcf_files}
+    bcftools view cohort.merged.preprocessed.vcf.gz | \\
         bcftools norm -m-any | \\
         bcftools +fill-tags -- -t VAF | \\
         bcftools +setGT -- -t q -n . -i 'FORMAT/DP <= 3' 2>/dev/null | \\
@@ -200,9 +205,9 @@ process MERGE_COHORT_VCF {
         bcftools +fill-tags -- -t AC,AC_Hom,AC_Het,AC_Hemi,AF,AN,ExcHet,HWE | \\
         bcftools view -Oz -o cohort.merged.AC.vcf.gz && \\
     bcftools view cohort.merged.AC.vcf.gz -e "INFO/AC>6 || INFO/AN=0" -Oz -o cohort.merged.AC.gt6.vcf.gz && \\
-    bcftools +trio-dnm2 -P cohort.ped --use-NAIVE --dnm-tag DNM:flag cohort.merged.AC.gt6.vcf.gz -Oz -o cohort.merged.dnm.vcf.gz
+    bcftools +trio-dnm2 -P cohort.ped --use-NAIVE --dnm-tag DNM:flag cohort.merged.AC.gt6.vcf.gz -Oz -o cohort_${timestamp}.merged.vcf.gz
 
-    bcftools index -t cohort.merged.dnm.vcf.gz
+    bcftools index -t cohort_${timestamp}.merged.vcf.gz
     """
 }
 

@@ -83,29 +83,25 @@ workflow {
         )
 
         // 3. Split the merged VCF and annotate each sample with parental genotypes
-        MERGE_COHORT_VCF.out.flatMap { all_meta, merged_vcf, merged_vcf_index ->
+        affected_samples_ch = MERGE_COHORT_VCF.out.flatMap { all_meta, merged_vcf, merged_vcf_index ->
             all_meta.collect { sample_meta ->
                 tuple(sample_meta, all_meta, merged_vcf, merged_vcf_index)
             }
         }
-        .set { samples_to_process_ch }
+        // 4. FILTER for AFFECTED samples before Annotation
+        .filter { sample_meta, _all_meta, _merged_vcf, _merged_vcf_index ->
+            sample_meta.affected == '2'
+        }
 
-        EXTRACT_AND_ANNOTATE_SAMPLE(samples_to_process_ch)
-
-        // 4. FILTER for AFFECTED samples before running Exomiser
-        EXTRACT_AND_ANNOTATE_SAMPLE.out
-            .filter { meta, vcf, tbi ->
-                meta.affected == '2'
-            }
-            .set { affected_samples_ch }
+        EXTRACT_AND_ANNOTATE_SAMPLE(affected_samples_ch)
 
         // 5. Run Exomiser and subsequent steps ONLY on the filtered affected samples
         CREATE_YAML(
-            affected_samples_ch,
+            EXTRACT_AND_ANNOTATE_SAMPLE.out,
             file(params.template_yaml, checkIfExists:true),
             file(params.exomiser_yaml_python_script_path, checkIfExists:true)
         )
-
+        
         RUN_EXOMISER(CREATE_YAML.out.yaml_and_vcf)
 
         // The explicit call below is REMOVED.
@@ -405,3 +401,4 @@ process RUN_EXOMISER_SPLIT{
     python3 $python_script $vep_tsv "${sample_id}.vep.populated.tsv"
     """
 }
+

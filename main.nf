@@ -22,6 +22,7 @@ touch "NONE.fq"
 
 params.input_merged_vcf = "NONE.fq"  // Path to pre-merged cohort VCF (if available)
 params.input_merged_vcf_index = "NONE.fq.csi"  // Path to index of pre-merged cohort VCF (if available)
+params.skip_merge = true  // If true, will not merge the samples into a single VCF
 // --- Log pipeline parameters ---
 log.info """
           E X O M I S E R - N F   P I P E L I N E (Cohort Run with Pedigree)
@@ -33,6 +34,8 @@ log.info """
           Exomiser JAR                   : ${params.exomiser_jar_path}
           Exomiser data dir              : ${params.exomiser_data_dir_host}
           ClinVar reference file         : ${params.clinvar_reference_file}
+          merged VCF                     : ${params.input_merged_vcf}
+          merged VCF index               : ${params.input_merged_vcf_index}
 
           ---
           """
@@ -40,9 +43,9 @@ log.info """
 
 workflow {
     main:
-        Channel
+        channel
             .fromPath(params.samplesheet)
-            .ifEmpty { error "Samplesheet file not found: ${params.samplesheet}" }
+            //.ifEmpty { error "Samplesheet file not found: ${params.samplesheet}" }
             .splitCsv(header:true, sep:'\t')
             .map { row ->
                 // VALIDATION: If sample is affected (2), it MUST have HPO terms.
@@ -64,36 +67,71 @@ workflow {
             .collect()
             .set { cohort_ch }
 
-        if(params.input_merged_vcf != "NONE.fq"){
-            log.info "Checking provided merged VCF for duplicates: ${params.input_merged_vcf}"
-            CHECK_EXISTING_SAMPLE_IN_MERGED_VCF(
-                file(params.input_merged_vcf, checkIfExists:true),
-                file(params.input_merged_vcf_index, checkIfExists:true),
-                cohort_ch
-            )
-        }
-        else{
-            log.info "No provided merged VCF, will create new merged VCF from individual sample VCFs."
-        }
+        if(params.input_merged_vcf != "NONE.fq"){ // If a provided merged VCF is provided, filter the samples that exist in the provided merged VCF
 
-        // 2. Merge VCFs for the entire cohort (affected + unaffected)
-        MERGE_COHORT_VCF(cohort_ch,
-            file(params.input_merged_vcf),
-            file(params.input_merged_vcf_index)
-        )
+            log.info "Filtering samples that exist in the provided merged VCF: ${params.input_merged_vcf} from the samplesheet samples list: ${params.samplesheet}."
+            FILTER_EXISTING_SAMPLES(
+                cohort_ch,
+                file(params.input_merged_vcf, checkIfExists:true),
+                file(params.input_merged_vcf_index, checkIfExists:true)
+            )
+
+            samples_to_merge_list_ch = FILTER_EXISTING_SAMPLES.out.samples_to_merge_list
+                .splitCsv(header:true, sep:'\t')
+                .map { row ->
+                    // Create a metadata map for each sample
+                    [
+                        sample_id: row.sample_id,
+                        vcf: row.vcf
+                    ]
+                }
+                .collect()
+
+
+            if(params.skip_merge == false){
+                MERGE_COHORT_VCF(
+                    samples_to_merge_list_ch,
+                    file(params.input_merged_vcf),
+                    file(params.input_merged_vcf_index)
+                )
+                merged_vcf_cohort = MERGE_COHORT_VCF.out.merged_vcf_cohort_path
+                merged_vcf_cohort_index = MERGE_COHORT_VCF.out.merged_vcf_cohort_index_path
+            }
+            else{
+                SKIP_MERGED_VCF(
+                    file(params.input_merged_vcf),
+                    file(params.input_merged_vcf_index)
+                )
+                merged_vcf_cohort = SKIP_MERGED_VCF.out.merged_vcf_path
+                merged_vcf_cohort_index = SKIP_MERGED_VCF.out.merged_vcf_index_path
+            }
+        }
+        else{ // If no provided merged VCF, create a new merged VCF from individual sample VCFs
+            log.info "No provided merged VCF, will create new merged VCF from individual sample VCFs."
+            // 2.2 Merge VCFs for the entire cohort (affected + unaffected)
+            CREATE_MERGED_VCF(cohort_ch)
+            // Extract file paths from tuple (meta_list, vcf, vcf_index) - process emits once, so channel broadcasts to all subscribers
+            merged_vcf_cohort = CREATE_MERGED_VCF.out.merged_vcf_cohort_path
+            merged_vcf_cohort_index = CREATE_MERGED_VCF.out.merged_vcf_cohort_index_path
+        }
 
         // 3. Split the merged VCF and annotate each sample with parental genotypes
-        affected_samples_ch = MERGE_COHORT_VCF.out.flatMap { all_meta, merged_vcf, merged_vcf_index ->
+        affected_samples_ch = cohort_ch.flatMap { all_meta ->
             all_meta.collect { sample_meta ->
-                tuple(sample_meta, all_meta, merged_vcf, merged_vcf_index)
+                tuple(sample_meta, all_meta)
             }
         }
         // 4. FILTER for AFFECTED samples before Annotation
-        .filter { sample_meta, _all_meta, _merged_vcf, _merged_vcf_index ->
+        .filter { sample_meta, _all_meta ->
             sample_meta.affected == '2'
         }
+        //affected_samples_ch.view { all_meta -> "AFFECTED SAMPLE: ${all_meta.sample_id}" }
 
-        EXTRACT_AND_ANNOTATE_SAMPLE(affected_samples_ch)
+        EXTRACT_AND_ANNOTATE_SAMPLE(
+            affected_samples_ch,
+            merged_vcf_cohort,
+            merged_vcf_cohort_index
+        )
 
         // 5. Run Exomiser and subsequent steps ONLY on the filtered affected samples
         CREATE_YAML(
@@ -132,65 +170,85 @@ workflow {
 // as they need to run on the full cohort. All other processes are also identical
 // but will now only be executed for the filtered, affected samples.
 
-process CHECK_EXISTING_SAMPLE_IN_MERGED_VCF {
+process FILTER_EXISTING_SAMPLES {
     // Exists upon encountering any sample already present in the provided merged VCF
-    input:
-    path(input_merged_vcf)
-    path(input_merged_vcf_index)
-    val(meta_list)
-
-    script:
-    def vcf_files = meta_list.collect { it.vcf }.join(' ')
-    """
-    echo "existing samples are: $vcf_files"
-    # Gather existing samples from the provided merged VCF (if possible)
-    EXISTING_SAMPLES=\$(bcftools query -l ${input_merged_vcf} 2>/dev/null || true)
-    echo "Existing samples in provided merged VCF: \$EXISTING_SAMPLES"
-
-    # Build list of VCF files to add by checking sample name in each per-sample VCF
-    VCFS_TO_ADD=""
-    for vcf in ${vcf_files}; do
-        bcftools index -f \$vcf
-        sample_name=\$(bcftools query -l \$vcf | head -n1 || true)
-        if [ -n "\$sample_name" ] && echo "\$EXISTING_SAMPLES" | grep -qx "\$sample_name"; then
-            echo "New sample \$sample_name is already present in provided merged VCF; exiting."
-            exit 2
-        fi
-    done
-    """
-}
-
-process MERGE_COHORT_VCF {
-    tag "Merging ${meta_list.size()} samples into merged VCF"
-    publishDir "${params.outdir}/pipeline_info/merged_vcfs", mode: 'copy', pattern: "*.vcf.gz*", overwrite: true
-
     input:
     val(meta_list)
     path(input_merged_vcf)
     path(input_merged_vcf_index)
 
     output:
-    tuple val(meta_list), path("cohort_${timestamp}.merged.vcf.gz"), path("cohort_${timestamp}.merged.vcf.gz.tbi"), emit: merged_vcf_cohort
+    path("samples_to_merge_list.txt"), emit: samples_to_merge_list
 
     script:
-    def vcf_files = meta_list.collect { it.vcf }.join(' ')
-    def ped_content = meta_list.collect {
-        "${it.famid}\t${it.sample_id}\t${it.father_id}\t${it.mother_id}\t${it.sex}\t${it.affected}"
-    }.join('\\n')
+    def sample_ids = meta_list.collect { it.sample_id }.join('" "')
+    def vcf_files = meta_list.collect { it.vcf }.join('" "')
+    def meta_list_size = meta_list.size()
+    """
+    # Gather existing samples from the provided merged VCF (one per line, trimmed)
+    bcftools query -l ${input_merged_vcf} > existing_samples.txt
+
+    # Build list of sample IDs from the samplesheet (per-sample VCFs)
+    # that are NOT already present in the provided merged VCF
+    SAMPLE_IDS=( "${sample_ids}" )
+    VCF_FILES=( "${vcf_files}" )
+    echo "sample_id\tvcf\n" > samples_to_merge_list.txt
+    for sample_index in {0..${meta_list_size-1}}; do
+        if ! grep -qFx "\${SAMPLE_IDS[sample_index]}" existing_samples.txt 2>/dev/null; then
+            echo "\${SAMPLE_IDS[sample_index]}\t\${VCF_FILES[sample_index]}\n" >> samples_to_merge_list.txt
+        fi
+    done
+    """
+}
+
+process SKIP_MERGED_VCF {
+    tag "Skipping merging of samples into merged VCF and using provided merged VCF"
+    publishDir "${params.outdir}/pipeline_info/merged_vcfs", mode: 'copy', pattern: "*.vcf.gz*", overwrite: true
+    input:
+    path(input_merged_vcf)
+    path(input_merged_vcf_index)
+
+    output:
+    path(input_merged_vcf), emit: merged_vcf_path
+    path(input_merged_vcf_index), emit: merged_vcf_index_path
+    script:
+    """
+    touch ${input_merged_vcf}
+    touch ${input_merged_vcf_index}
+    """
+}
+process MERGE_COHORT_VCF {
+    tag "Merging ${samples_to_merge_list.size()} samples into merged VCF"
+    publishDir "${params.outdir}/pipeline_info/merged_vcfs", mode: 'copy', pattern: "*.vcf.gz*", overwrite: true
+
+    input:
+    val(samples_to_merge_list)
+    path(input_merged_vcf)
+    path(input_merged_vcf_index)
+
+    output:
+    path("cohort_${timestamp}.merged.vcf.gz"), emit: merged_vcf_cohort_path
+    path("cohort_${timestamp}.merged.vcf.gz.tbi"), emit: merged_vcf_cohort_index_path
+
+    script:
+    def vcf_files = samples_to_merge_list.collect { it.vcf }.join(' ')
+    // if(samples_to_merge_list.size() > 0){ vcf_files = samples_to_merge_list.collect { it.vcf }.join(' '); }
+
     def merged_file = input_merged_vcf.getName() == "NONE.fq" ? "" : input_merged_vcf.name
 
     Date now = new Date();
     SimpleDateFormat timestamp_formatter = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss");
     timestamp = timestamp_formatter.format(now)
 
+    log.info "New sample IDs found, will create new merged VCF from individual sample VCFs."
     """
-    echo -e "${ped_content}" > cohort.ped
-    echo "Processing with provided merged VCF: ${input_merged_vcf}"
-    
-    echo "Creating new merged VCF from individual sample VCFs"
-    echo -e "${ped_content}" > cohort.ped
-    for vcf in ${vcf_files}; do bcftools index -f \$vcf; done
-    bcftools merge -m none --threads 16 -Oz -o cohort.merged.preprocessed.vcf.gz ${merged_file} ${vcf_files}
+        echo "Processing with provided merged VCF: ${input_merged_vcf}"
+        
+        echo "Creating new merged VCF from individual sample VCFs"
+        for vcf in ${vcf_files}; do bcftools index -f \$vcf; done
+        bcftools merge -m none --threads 16 -Oz -o cohort.merged.preprocessed.vcf.gz ${merged_file} ${vcf_files}
+
+
     bcftools view cohort.merged.preprocessed.vcf.gz | \\
         bcftools norm -m-any | \\
         bcftools +fill-tags -- -t VAF | \\
@@ -200,17 +258,54 @@ process MERGE_COHORT_VCF {
         bcftools +setGT -- -t q -n . -i '24 <= FORMAT/DP & FORMAT/VAF< 0.17' 2>/dev/null | \\
         bcftools +fill-tags -- -t AC,AC_Hom,AC_Het,AC_Hemi,AF,AN,ExcHet,HWE | \\
         bcftools view -Oz -o cohort.merged.AC.vcf.gz && \\
-    bcftools view cohort.merged.AC.vcf.gz -e "INFO/AC>6 || INFO/AN=0" -Oz -o cohort.merged.AC.gt6.vcf.gz && \\
-    bcftools +trio-dnm2 -P cohort.ped --use-NAIVE --dnm-tag DNM:flag cohort.merged.AC.gt6.vcf.gz -Oz -o cohort_${timestamp}.merged.vcf.gz
+    bcftools view cohort.merged.AC.vcf.gz -e "INFO/AC>6 || INFO/AN=0" -Oz -o cohort_${timestamp}.merged.vcf.gz
 
     bcftools index -t cohort_${timestamp}.merged.vcf.gz
     """
 }
 
+process CREATE_MERGED_VCF {
+    tag "Creating new merged VCF with ${meta_list.size()} samples."
+    publishDir "${params.outdir}/pipeline_info/merged_vcfs", mode: 'copy', pattern: "*.vcf.gz*", overwrite: true
+
+    input:
+    val(meta_list)
+
+    output:
+    path("cohort_${timestamp}.merged.vcf.gz"), emit: merged_vcf_cohort_path
+    path("cohort_${timestamp}.merged.vcf.gz.tbi"), emit: merged_vcf_cohort_index_path
+
+    script:
+    def vcf_files = meta_list.collect { it.vcf }.join(' ')
+    Date now = new Date();
+    SimpleDateFormat timestamp_formatter = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss");
+    timestamp = timestamp_formatter.format(now)
+
+    """    
+    echo "Creating new merged VCF from individual sample VCFs"
+
+    for vcf in ${vcf_files}; do bcftools index -f \$vcf; done
+    bcftools merge -m none --threads 16 -Oz -o cohort.merged.preprocessed.vcf.gz ${vcf_files}
+    bcftools view cohort.merged.preprocessed.vcf.gz | \\
+        bcftools norm -m-any | \\
+        bcftools +fill-tags -- -t VAF | \\
+        bcftools +setGT -- -t q -n . -i 'FORMAT/DP <= 3' 2>/dev/null | \\
+        bcftools +setGT -- -t q -n . -i 'FORMAT/DP < 6 & FORMAT/VAF < 1' 2>/dev/null | \\
+        bcftools +setGT -- -t q -n . -i '6 <= FORMAT/DP & FORMAT/DP < 24 & FORMAT/VAF < 0.35' 2>/dev/null | \\
+        bcftools +setGT -- -t q -n . -i '24 <= FORMAT/DP & FORMAT/VAF< 0.17' 2>/dev/null | \\
+        bcftools +fill-tags -- -t AC,AC_Hom,AC_Het,AC_Hemi,AF,AN,ExcHet,HWE | \\
+        bcftools view -Oz -o cohort.merged.AC.vcf.gz && \\
+    bcftools view cohort.merged.AC.vcf.gz -e "INFO/AC>6 || INFO/AN=0" -Oz -o cohort_${timestamp}.merged.vcf.gz
+
+    bcftools index -t cohort_${timestamp}.merged.vcf.gz
+    """
+}
 process EXTRACT_AND_ANNOTATE_SAMPLE {
     tag "${meta.sample_id}"
     input:
-    tuple val(meta), val(all_meta), path(merged_vcf), path(merged_vcf_index)
+    tuple val(meta), val(all_meta)
+    path(merged_vcf)
+    path(merged_vcf_index)
 
     output:
     tuple val(meta), path("${meta.sample_id}.final.vcf.gz"), path("${meta.sample_id}.final.vcf.gz.tbi")
@@ -376,7 +471,7 @@ process RUN_VEP_SPLIT{
     script:
     def sample_id = meta.sample_id
     """
-    columns="[%SAMPLE]\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%ID\\t%FILTER\\t%Exomiser[\\t%GT\\t%maternal_GT\\t%paternal_GT\\t%VAF\\t%AD\\t%DP\\t%DNM\\t%VA]\\t%AC_Het\\t%AC_Hom\\t%AC_Hemi\\t%HWE\\t%ExcHet\\t%AN\\t%AC\$(bcftools +split-vep -l ${vep_vcf} | cut -f2 | sed 's/^/\\\\\\\\t%/' | tr -d '\n' | xargs)"
+    columns="[%SAMPLE]\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%ID\\t%FILTER\\t%Exomiser[\\t%GT\\t%maternal_GT\\t%paternal_GT\\t%VAF\\t%AD\\t%DP]\\t%AC_Het\\t%AC_Hom\\t%AC_Hemi\\t%HWE\\t%ExcHet\\t%AN\\t%AC\$(bcftools +split-vep -l ${vep_vcf} | cut -f2 | sed 's/^/\\\\\\\\t%/' | tr -d '\n' | xargs)"
     header=\$(echo "\$columns" | sed "s/%//g;s/\\[//g;s/\\]//g")
 
     (echo -e \$header; bcftools view ${vep_vcf} | \\
@@ -401,4 +496,3 @@ process RUN_EXOMISER_SPLIT{
     python3 $python_script $vep_tsv "${sample_id}.vep.populated.tsv"
     """
 }
-

@@ -60,60 +60,56 @@ workflow {
                     mother_id: row.mother_id,
                     sex: row.sex,
                     affected: row.affected,
-                    vcf: file(row.vcf, checkIfExists:true),
+                    vcf: row.vcf,
                     hpo: row.hpo
                 ]
             }
             .collect()
             .set { cohort_ch }
 
-        if(params.input_merged_vcf != "NONE.fq"){ // If a provided merged VCF is provided, filter the samples that exist in the provided merged VCF
-
-            log.info "Filtering samples that exist in the provided merged VCF: ${params.input_merged_vcf} from the samplesheet samples list: ${params.samplesheet}."
-            FILTER_EXISTING_SAMPLES(
-                cohort_ch,
+        vcfs_to_add = ""
+        rerun_index_list = ""
+        if(params.input_merged_vcf != "NONE.fq"){
+            log.info "Checking provided merged VCF for duplicates: ${params.input_merged_vcf}"
+            CHECK_EXISTING_SAMPLE_IN_MERGED_VCF(
                 file(params.input_merged_vcf, checkIfExists:true),
-                file(params.input_merged_vcf_index, checkIfExists:true)
+                file(params.input_merged_vcf_index, checkIfExists:true),
+                cohort_ch
             )
-
-            samples_to_merge_list_ch = FILTER_EXISTING_SAMPLES.out.samples_to_merge_list
-                .splitCsv(header:true, sep:'\t')
-                .map { row ->
-                    // Create a metadata map for each sample
-                    [
-                        sample_id: row.sample_id,
-                        vcf: row.vcf
-                    ]
+            CHECK_EXISTING_SAMPLE_IN_MERGED_VCF.out.vcfs_to_add_file
+                .map { file ->
+                    file.text.trim().tokenize().join(' ')
                 }
-                .collect()
+                .set { vcfs_to_add }
 
+            CHECK_EXISTING_SAMPLE_IN_MERGED_VCF.out.rerun_index_list_file
+                .map { file ->
+                    file.text.trim().tokenize().join(' ')
+                }
+                .set { rerun_index_list }
 
-            if(params.skip_merge == false){
-                MERGE_COHORT_VCF(
-                    samples_to_merge_list_ch,
-                    file(params.input_merged_vcf),
-                    file(params.input_merged_vcf_index)
-                )
-                merged_vcf_cohort = MERGE_COHORT_VCF.out.merged_vcf_cohort_path
-                merged_vcf_cohort_index = MERGE_COHORT_VCF.out.merged_vcf_cohort_index_path
-            }
-            else{
-                SKIP_MERGED_VCF(
-                    file(params.input_merged_vcf),
-                    file(params.input_merged_vcf_index)
-                )
-                merged_vcf_cohort = SKIP_MERGED_VCF.out.merged_vcf_path
-                merged_vcf_cohort_index = SKIP_MERGED_VCF.out.merged_vcf_index_path
+            validated_cohort_ch = cohort_ch.map { cohort -> 
+                validateSamplesheet(cohort,
+                                    CHECK_EXISTING_SAMPLE_IN_MERGED_VCF.out.existing_samples,
+                                    rerun_index_list)
+                cohort
             }
         }
         else{ // If no provided merged VCF, create a new merged VCF from individual sample VCFs
             log.info "No provided merged VCF, will create new merged VCF from individual sample VCFs."
-            // 2.2 Merge VCFs for the entire cohort (affected + unaffected)
-            CREATE_MERGED_VCF(cohort_ch)
-            // Extract file paths from tuple (meta_list, vcf, vcf_index) - process emits once, so channel broadcasts to all subscribers
-            merged_vcf_cohort = CREATE_MERGED_VCF.out.merged_vcf_cohort_path
-            merged_vcf_cohort_index = CREATE_MERGED_VCF.out.merged_vcf_cohort_index_path
+            
+            validated_cohort_ch = cohort_ch.map { cohort -> 
+                validateSamplesheet(cohort, [], []) // No existing samples to check against
+                cohort
+            }
         }
+
+        // 2. Merge VCFs for the entire cohort (affected + unaffected)
+        MERGE_COHORT_VCF(validated_cohort_ch,
+            file(params.input_merged_vcf),
+            file(params.input_merged_vcf_index),
+            vcfs_to_add
+        )
 
         // 3. Split the merged VCF and annotate each sample with parental genotypes
         affected_samples_ch = cohort_ch.flatMap { all_meta ->
@@ -176,29 +172,111 @@ process FILTER_EXISTING_SAMPLES {
     val(meta_list)
     path(input_merged_vcf)
     path(input_merged_vcf_index)
+    val(meta_list)
 
     output:
-    path("samples_to_merge_list.txt"), emit: samples_to_merge_list
+    tuple val(meta_list), emit: existing_samples
+    path "vcfs_to_add", emit:vcfs_to_add_file
+    path "rerun_index_list", emit: rerun_index_list_file
 
     script:
-    def sample_ids = meta_list.collect { it.sample_id }.join('" "')
-    def vcf_files = meta_list.collect { it.vcf }.join('" "')
-    def meta_list_size = meta_list.size()
+    def vcf_rows = meta_list.collect { "${it.vcf},${it.affected},${it.sample_id}" }.join('\n')
     """
-    # Gather existing samples from the provided merged VCF (one per line, trimmed)
-    bcftools query -l ${input_merged_vcf} > existing_samples.txt
+    cat > sample_vcfs.tsv <<'EOF'
+${vcf_rows}
+EOF
+    echo "existing sample VCFs are:"
+    cat sample_vcfs.tsv
+    # Gather existing samples from the provided merged VCF (if possible)
+    EXISTING_SAMPLES=\$(bcftools query -l ${input_merged_vcf} 2>/dev/null || true)
+    echo "Existing samples in provided merged VCF: \$EXISTING_SAMPLES"
 
-    # Build list of sample IDs from the samplesheet (per-sample VCFs)
-    # that are NOT already present in the provided merged VCF
-    SAMPLE_IDS=( "${sample_ids}" )
-    VCF_FILES=( "${vcf_files}" )
-    echo "sample_id\tvcf\n" > samples_to_merge_list.txt
-    for sample_index in {0..${meta_list_size-1}}; do
-        if ! grep -qFx "\${SAMPLE_IDS[sample_index]}" existing_samples.txt 2>/dev/null; then
-            echo "\${SAMPLE_IDS[sample_index]}\t\${VCF_FILES[sample_index]}\n" >> samples_to_merge_list.txt
+    # Build list of VCF files to add by checking sample name in each per-sample VCF
+    VCFS_TO_ADD=""
+    RERUN_INDEX_LIST=""
+    while IFS=\$',' read -r vcf affected sample_id; do
+        if [ -n "\$vcf" ]; then
+            bcftools index -f "\$vcf"
+            sample_name=\$(bcftools query -l "\$vcf" | head -n1 || true)
+        else
+            sample_name="\$sample_id"
         fi
-    done
+        if [ -n "\$sample_name" ] && echo "\$EXISTING_SAMPLES" | grep -qx "\$sample_name"; then
+            if [ "\$affected" = "2" ]; then
+                RERUN_INDEX_LIST="\$RERUN_INDEX_LIST \$sample_id"
+                continue
+            fi
+            echo "New sample \$sample_name is already present in provided merged VCF; skipping."
+            continue
+        fi
+        if [ -n "\$vcf" ]; then
+            VCFS_TO_ADD="\$VCFS_TO_ADD \$vcf"
+        fi
+    done < sample_vcfs.tsv
+    echo "\$VCFS_TO_ADD" > vcfs_to_add
+    echo "\$RERUN_INDEX_LIST" > rerun_index_list
     """
+}
+
+
+// --- Samplesheet Validation ---
+def validateSamplesheet(cohort, existing_samples, rerun_index_list) {
+    def errors = []
+    def sample_ids = cohort.collect { it.sample_id }
+
+    cohort.each { sample ->
+        // Check for leading/trailing whitespace in any field
+        ['famid', 'sample_id', 'father_id', 'mother_id', 'sex', 'affected', 'vcf', 'hpo'].each { field ->
+            def val = sample[field]?.toString()
+            if (val && val != val.trim()) {
+                errors << "Sample '${sample.sample_id}': field '${field}' has leading/trailing whitespace: '${val}'"
+            }
+        }
+
+        // Check affected samples have HPO terms
+        if (sample.affected == '2' && !sample.hpo?.trim()) {
+            errors << "Sample '${sample.sample_id}': affected but has no HPO terms."
+        }
+
+        // Check HPO term validity and format
+        if (sample.hpo?.trim()) {
+            if (!sample.hpo.tokenize().every { it.matches('^HP:\\d+$') }) {
+                errors << "Sample '${sample.sample_id}': HPO terms '${sample.hpo}' are invalid (must be in HP:XXXX format)."
+            }
+        }
+
+        // Check father_id resolves to a known sample_id
+        if (sample.father_id != '0' && ( !sample_ids.contains(sample.father_id) && !existing_samples.contains(sample.father_id))) {
+            errors << "Sample '${sample.sample_id}': father_id '${sample.father_id}' not found in samplesheet or provided merged VCF."
+        }
+
+        // Check mother_id resolves to a known sample_id
+        if (sample.mother_id != '0' && ( !sample_ids.contains(sample.mother_id) && !existing_samples.contains(sample.mother_id))) {
+            errors << "Sample '${sample.sample_id}': mother_id '${sample.mother_id}' not found in samplesheet or provided merged VCF."
+        }
+
+        // Check sex field is valid
+        if (!['0', '1', '2'].contains(sample.sex)) {
+            errors << "Sample '${sample.sample_id}': sex '${sample.sex}' is invalid (must be 0, 1, or 2)."
+        }
+
+        // Check affected field is valid
+        if (!['0', '1', '2'].contains(sample.affected)) {
+            errors << "Sample '${sample.sample_id}': affected '${sample.affected}' is invalid (must be 0, 1, or 2)."
+        }
+
+        // Check if VCF files exist --unless it is an existing index, then it should be empty
+        if (!rerun_index_list.contains(sample.sample_id)) {
+            file(sample.vcf, checkIfExists:true)
+        }
+    }
+
+    if (errors) {
+        log.error "Samplesheet validation failed with ${errors.size()} error(s):\n" + errors.collect { "  - ${it}" }.join("\n")
+        System.exit(1)
+    } else {
+        log.info "Samplesheet validation passed for ${cohort.size()} samples."
+    }
 }
 
 process SKIP_MERGED_VCF {
@@ -225,15 +303,17 @@ process MERGE_COHORT_VCF {
     val(samples_to_merge_list)
     path(input_merged_vcf)
     path(input_merged_vcf_index)
+    val(vcfs_to_add)
 
     output:
     path("cohort_${timestamp}.merged.vcf.gz"), emit: merged_vcf_cohort_path
     path("cohort_${timestamp}.merged.vcf.gz.tbi"), emit: merged_vcf_cohort_index_path
 
     script:
-    def vcf_files = samples_to_merge_list.collect { it.vcf }.join(' ')
-    // if(samples_to_merge_list.size() > 0){ vcf_files = samples_to_merge_list.collect { it.vcf }.join(' '); }
-
+    def vcf_files = vcfs_to_add != "" ? vcfs_to_add :meta_list.collect { it.vcf }.join(' ')
+    def ped_content = meta_list.collect {
+        "${it.famid}\t${it.sample_id}\t${it.father_id}\t${it.mother_id}\t${it.sex}\t${it.affected}"
+    }.join('\\n')
     def merged_file = input_merged_vcf.getName() == "NONE.fq" ? "" : input_merged_vcf.name
 
     Date now = new Date();
@@ -295,7 +375,7 @@ process CREATE_MERGED_VCF {
         bcftools +setGT -- -t q -n . -i '24 <= FORMAT/DP & FORMAT/VAF< 0.17' 2>/dev/null | \\
         bcftools +fill-tags -- -t AC,AC_Hom,AC_Het,AC_Hemi,AF,AN,ExcHet,HWE | \\
         bcftools view -Oz -o cohort.merged.AC.vcf.gz && \\
-    bcftools view cohort.merged.AC.vcf.gz -e "INFO/AC>6 || INFO/AN=0" -Oz -o cohort_${timestamp}.merged.vcf.gz
+    bcftools view cohort.merged.AC.vcf.gz -e "INFO/AC>20 || INFO/AN=0" -Oz -o cohort_${timestamp}.merged.vcf.gz
 
     bcftools index -t cohort_${timestamp}.merged.vcf.gz
     """
@@ -334,8 +414,7 @@ process EXTRACT_AND_ANNOTATE_SAMPLE {
 
     # Annotate with paternal genotype from the ORIGINAL father's VCF
     if [ "$father_id" != "0" ]; then
-        bcftools index -f "${father_vcf_path}"
-        bcftools query -f '%CHROM\\t%POS\\t[%GT]\\n' -s "$father_id" "${father_vcf_path}" | bgzip -c > paternal_gt.txt.gz
+        bcftools query -f '%CHROM\\t%POS\\t[%GT]\\n' -s "$father_id" $merged_vcf | bgzip -c > paternal_gt.txt.gz
         tabix -s1 -b2 -e2 paternal_gt.txt.gz
         bcftools annotate -a paternal_gt.txt.gz -h pat_hdr.txt -c CHROM,POS,FORMAT/paternal_GT current.vcf.gz -Oz -o annotated.tmp.vcf.gz
         mv annotated.tmp.vcf.gz current.vcf.gz
@@ -343,8 +422,7 @@ process EXTRACT_AND_ANNOTATE_SAMPLE {
 
     # Annotate with maternal genotype from the ORIGINAL mother's VCF
     if [ "$mother_id" != "0" ]; then
-        bcftools index -f "${mother_vcf_path}"
-        bcftools query -f '%CHROM\\t%POS\\t[%GT]\\n' -s "$mother_id" "${mother_vcf_path}" | bgzip -c > maternal_gt.txt.gz
+        bcftools query -f '%CHROM\\t%POS\\t[%GT]\\n' -s "$mother_id" $merged_vcf | bgzip -c > maternal_gt.txt.gz
         tabix -s1 -b2 -e2 maternal_gt.txt.gz
         bcftools annotate -a maternal_gt.txt.gz -h mat_hdr.txt -c CHROM,POS,FORMAT/maternal_GT current.vcf.gz -Oz -o annotated.tmp.vcf.gz
         mv annotated.tmp.vcf.gz current.vcf.gz
